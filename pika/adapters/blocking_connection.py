@@ -1067,19 +1067,26 @@ class _ConsumerDeliveryEvt(_ChannelPendingEvt):
     properties, and body of the delivered message.
     """
 
-    __slots__ = ('body', 'method', 'properties')
+    __slots__ = ('body', 'generation_seq', 'method', 'properties')
 
-    def __init__(self, method: pika.spec.Basic.Deliver,
-                 properties: pika.spec.BasicProperties, body: bytes) -> None:
+    def __init__(self,
+                 method: pika.spec.Basic.Deliver,
+                 properties: pika.spec.BasicProperties,
+                 body: bytes,
+                 generation_seq: int | None = None) -> None:
         """
         :param method: NOTE: consumer_tag and delivery_tag
           are valid only within source channel
         :param properties: message properties
         :param body: message body; empty string if no body
+        :param generation_seq: seq of the inbound delivery generation the
+          event was queued under; events belonging to an abandoned generation
+          are voided instead of dispatched
         """
         self.method = method
         self.properties = properties
         self.body = body
+        self.generation_seq = generation_seq
 
 
 class _ConsumerCancellationEvt(_ChannelPendingEvt):
@@ -1115,13 +1122,15 @@ class _ConsumerCancellationEvt(_ChannelPendingEvt):
 class _ReturnedMessageEvt(_ChannelPendingEvt):
     """This event represents a message returned by broker via `Basic.Return`"""
 
-    __slots__ = ('body', 'callback', 'channel', 'method', 'properties')
+    __slots__ = ('body', 'callback', 'channel', 'generation_seq', 'method',
+                 'properties')
 
     def __init__(self, callback: Callable[[
         BlockingChannel, pika.spec.Basic.Return, pika.spec.
         BasicProperties, bytes
     ], None], channel: BlockingChannel, method: pika.spec.Basic.Return,
-                 properties: pika.spec.BasicProperties, body: bytes) -> None:
+                 properties: pika.spec.BasicProperties, body: bytes,
+                 generation_seq: int | None = None) -> None:
         """
         :param callback: user's callback, having the signature
             callback(channel, method, properties, body), where
@@ -1139,6 +1148,7 @@ class _ReturnedMessageEvt(_ChannelPendingEvt):
         self.method = method
         self.properties = properties
         self.body = body
+        self.generation_seq = generation_seq
 
     @override
     def __repr__(self) -> str:
@@ -1338,6 +1348,9 @@ class BlockingChannel:
         # _ConsumerCancellationEvt objects that will be returned by
         # `BlockingChannel.get_event()`
         self._pending_events: deque[Any] = deque()
+
+        # Delivery generations abandoned by the implementation channel.
+        self._dead_delivery_generation_seqs: set[int] = set()
 
         # Holds a ReturnedMessage object representing a message received via
         # Basic.Return in publisher-acknowledgments mode.
@@ -1559,7 +1572,12 @@ class BlockingChannel:
         :param properties: message properties
         :param body: delivered message body; empty string if no body
         """
-        evt = _ConsumerDeliveryEvt(method, properties, body)
+        generation = self._current_impl_generation()
+        evt = _ConsumerDeliveryEvt(
+            method,
+            properties,
+            body,
+            generation_seq=generation.seq if generation is not None else None)
 
         consumer = self._consumer_infos[method.consumer_tag]
 
@@ -1580,6 +1598,83 @@ class BlockingChannel:
         # Schedule termination of connection.process_data_events using a
         # negative channel number
         self.connection._request_channel_dispatch(-self.channel_number)
+
+    def _current_impl_generation(
+            self) -> pika.channel.DeliveryGeneration | None:
+        """The implementation channel's current delivery generation, or None
+        when the generation ledger is not in use (or the impl is a test
+        double).
+        """
+        generation = getattr(self._impl, 'current_delivery_generation', None)
+        if isinstance(generation, pika.channel.DeliveryGeneration):
+            return generation
+        return None
+
+    def _on_delivery_generation_abandoned(self, seq: int) -> None:
+        """Observer hook invoked by the implementation channel when a delivery
+        generation is abandoned. Delivery/return events already queued (in
+        ``_pending_events`` or the queue consumer generator sink) but not yet
+        dispatched are voided here.
+        """
+        self._dead_delivery_generation_seqs.add(seq)
+        self._purge_generation_events(self._pending_events, seq)
+        if self._queue_consumer_generator is not None:
+            self._purge_generation_events(
+                self._queue_consumer_generator.pending_events, seq)
+
+    @staticmethod
+    def _purge_generation_events(events: deque, seq: int) -> None:
+        """Remove delivery/return events tagged with the abandoned generation
+        seq from an event queue. Cancellation events are never generation
+        tagged and stay in place.
+        """
+        survivors: deque[_ChannelPendingEvt] = deque()
+        while events:
+            evt = events.popleft()
+            if type(evt) in (_ConsumerDeliveryEvt,
+                             _ReturnedMessageEvt) and evt.generation_seq == seq:  # pylint: disable=C0123
+                continue
+            survivors.append(evt)
+        events.extend(survivors)
+
+    def _evt_generation_dead(self, evt: _ChannelPendingEvt) -> bool:
+        """Defensive dispatch-time check: true for delivery/return events
+        whose generation was abandoned after they entered the queue.
+        """
+        seq = getattr(evt, 'generation_seq', None)
+        return seq is not None and seq in self._dead_delivery_generation_seqs
+
+    def begin_delivery_generation(self) -> pika.channel.DeliveryGeneration:
+        """Declare a nested inbound delivery generation on the implementation
+        channel; this BlockingChannel's pending event queues obey the same
+        generation semantics.
+
+        :rtype: pika.channel.DeliveryGeneration
+        """
+        return self._impl.begin_delivery_generation()
+
+    def advance_delivery_generation(
+            self,
+            requeue: bool = True) -> pika.channel.DeliveryGeneration:
+        """Abandon the current delivery generation and declare a new one;
+        events already queued for the abandoned generation are voided.
+
+        :rtype: pika.channel.DeliveryGeneration
+        """
+        return self._impl.advance_delivery_generation(requeue=requeue)
+
+    @property
+    def current_delivery_generation(
+            self) -> pika.channel.DeliveryGeneration | None:
+        """The implementation channel's current delivery generation."""
+        return self._current_impl_generation()
+
+    def _current_generation_seq(self) -> int | None:
+        """Seq of the current implementation-channel generation at event
+        construction time; None when the ledger is not in use."""
+        generation = self._current_impl_generation()
+        return generation.seq if generation is not None else None
+
 
     def _cancel_all_consumers(self) -> None:
         """
@@ -1607,6 +1702,11 @@ class BlockingChannel:
         """
         while self._pending_events:
             evt = self._pending_events.popleft()
+
+            if self._evt_generation_dead(evt):
+                # The delivery generation this event was queued under was
+                # abandoned before dispatch; void it.
+                continue
 
             if type(evt) is _ConsumerDeliveryEvt:
                 consumer_info = self._consumer_infos[evt.method.consumer_tag]
@@ -1705,7 +1805,13 @@ class BlockingChannel:
         """
         self._impl.add_on_return_callback(
             lambda _channel, method, properties, body: (self._add_pending_event(
-                _ReturnedMessageEvt(callback, self, method, properties, body))))
+                _ReturnedMessageEvt(callback,
+                                    self,
+                                    method,
+                                    properties,
+                                    body,
+                                    generation_seq=self._current_generation_seq(
+                                    )))))
 
     def basic_consume(self,
                       queue: str,
@@ -2136,6 +2242,8 @@ class BlockingChannel:
                     # Consumer was cancelled by broker
                     self._queue_consumer_generator = None
                     break
+                elif self._evt_generation_dead(evt):
+                    continue
                 else:
                     yield (evt.method, evt.properties, evt.body)
                     continue
@@ -2246,6 +2354,8 @@ class BlockingChannel:
                 #      from the server at the end (if any)
                 for _ in range(self.get_waiting_message_count()):
                     evt = pending_events.popleft()
+                    if self._evt_generation_dead(evt):
+                        continue
                     self._impl.basic_reject(evt.method.delivery_tag,
                                             requeue=True)
 

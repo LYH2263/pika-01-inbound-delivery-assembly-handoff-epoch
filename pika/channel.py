@@ -9,7 +9,7 @@ import logging
 import uuid
 from collections import deque
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Union
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union)
 
 from pika import exceptions, frame, spec, validators
 from pika._utils import as_bytes, override
@@ -24,6 +24,12 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 MAX_CHANNELS: int = 65535  # per AMQP 0.9.1 spec.
+
+# Inbound content handoff kinds. Deliver / Get / Return each have their
+# own staged-handoff invalidation rules; they must never be interchanged.
+_DELIVER_KIND = 'deliver'
+_GET_KIND = 'get'
+_RETURN_KIND = 'return'
 
 _OnAckNackCallback = Callable[
     [frame.Method[Union[spec.Basic.Ack, spec.Basic.Nack]]], None]
@@ -109,7 +115,9 @@ class Channel:
         # Initially, flow is assumed to be active
         self.flow_active = True
 
-        self._content_assembler = ContentFrameAssembler()
+        # Bound to this Channel so inbound handoffs can be staged against the
+        # current delivery generation while frames are still assembling.
+        self._content_assembler = ContentFrameAssembler(self)
 
         self._blocked: deque = deque()
         self._blocking: Any | None = None
@@ -119,6 +127,9 @@ class Channel:
         # them `_cancelled` retains; see `_retain_cancelled_tag`.
         self._nowait_cancelled: deque = deque()
         self._consumers: dict = {}
+        # Consumer tags registered with auto_ack/no_ack; needed so delivery
+        # generation abandon rules can fork ackable vs no-ack staged Delivers.
+        self._consumers_with_noack: set[str] = set()
         self._on_flowok_callback: Callable[..., Any] | None = None
         self._on_getok_callback: Callable[..., Any] | None = None
         self._on_ack_nack_callback: _OnAckNackCallback | None = None
@@ -135,6 +146,13 @@ class Channel:
         # opaque cookie value set by wrapper layer (e.g., BlockingConnection)
         # via _set_cookie
         self._cookie: object = None
+
+        # Nested inbound delivery-generation ledger (host-facing).
+        self._delivery_generations: List[DeliveryGeneration] = []
+        self._next_delivery_generation_seq: int = 0
+        # True while close() is issuing nowait cancels so per-consumer
+        # nowait generation settlement is deferred to whole-ledger teardown.
+        self._in_close_consumer_cancel: bool = False
 
         # Deliveries dropped by `_on_deliver` because the channel was no longer
         # open, reported once on the transition to CLOSED.
@@ -378,6 +396,13 @@ class Channel:
             # reaches the consumer rather than being dropped (#1389).  There is
             # no CancelOk to retire the entry, hence the bounded retention.
             self._retain_cancelled_tag(consumer_tag)
+            if not self._in_close_consumer_cancel:
+                # User-initiated fire-and-forget cancel: staged handoffs and
+                # the half-assembled content for this consumer are invalidated
+                # immediately, and its pending confirmation intents are
+                # dropped. Channel.close() performs its own whole-ledger
+                # teardown instead of this per-consumer hook.
+                self._generation_on_user_nowait_cancel(consumer_tag)
 
         # Through `_rpc`, so the callback is registered when this cancel is
         # sent and completes on its own reply, not an earlier one for the tag.
@@ -460,6 +485,9 @@ class Channel:
 
         if consumer_tag in self._consumers or consumer_tag in self._cancelled:
             raise exceptions.DuplicateConsumerTag(consumer_tag)
+
+        if auto_ack:
+            self._consumers_with_noack.add(consumer_tag)
 
         self._consumers[consumer_tag] = on_message_callback
 
@@ -652,6 +680,384 @@ class Channel:
         return self._rpc(spec.Basic.Recover(requeue), callback,
                          [spec.Basic.RecoverOk])
 
+    def begin_delivery_generation(self) -> DeliveryGeneration:
+        """Declare a new inbound delivery generation bound to this channel.
+
+        Content completing while the generation is current (Basic.Deliver,
+        Basic.GetOk and Basic.Return handoffs) is staged on the generation and
+        only reaches user callbacks after
+        :meth:`DeliveryGeneration.commit`. Generations nest: a generation
+        begun while another one is current is pushed above it and must end
+        (commit or abandon) before the outer generation may end.
+
+        :rtype: DeliveryGeneration
+        :raises exceptions.ChannelWrongStateError: if the channel is not open
+
+        """
+        self._raise_if_not_open()
+        generation = DeliveryGeneration(self,
+                                        self._next_delivery_generation_seq)
+        self._next_delivery_generation_seq += 1
+        self._delivery_generations.append(generation)
+        return generation
+
+    def advance_delivery_generation(self,
+                                    requeue: bool = True) -> DeliveryGeneration:
+        """Abandon the current generation, if one is open, and declare a new
+        one. Uncommitted staged handoffs and pending confirmation intents of
+        the old generation are settled with its abandon rules and can never
+        reach the new generation.
+
+        :param bool requeue: requeue ackable staged Deliver handoffs of the
+            abandoned generation
+        :rtype: DeliveryGeneration
+
+        """
+        current = self.current_delivery_generation
+        if current is not None and current.accepts_handoffs():
+            self._abandon_delivery_generation(current, requeue)
+        return self.begin_delivery_generation()
+
+    @property
+    def current_delivery_generation(self) -> Optional[DeliveryGeneration]:
+        """The innermost open delivery generation, or ``None`` when the
+        generation ledger is not in use."""
+        return self._delivery_generations[-1] \
+            if self._delivery_generations else None
+
+    def _generation_bind_partial(
+            self, kind: Optional[str],
+            method_frame: frame.Method) -> Optional[DeliveryGeneration]:
+        """Called by ContentFrameAssembler when a content method frame starts a
+        new partial assembly. The returned generation token follows the
+        assembly through its header and body frames, even across generation
+        boundaries. Content methods that are never inbound (``kind is None``)
+        are not bound to any generation.
+        """
+        if kind is None:
+            return None
+        return self.current_delivery_generation
+
+    def _generation_accept_assembled(self, kind: Optional[str],
+                                     generation: Optional[DeliveryGeneration],
+                                     method_frame: frame.Method,
+                                     header_frame: frame.Header,
+                                     body: bytes) -> None:
+        """Called by ContentFrameAssembler when content has fully assembled.
+
+        Assemblies started while a generation was open are staged into that
+        exact generation (possibly an outer one when a nested generation has
+        since begun); assemblies that finish only after their generation ended
+        are discarded as late partial content; assemblies started without any
+        generation take the legacy immediate exits.
+        """
+        if kind is None:
+            # Assembled content for a never-inbound method (e.g. Publish).
+            return
+
+        if generation is None:
+            self._dispatch_assembled_now(kind, method_frame, header_frame, body)
+            return
+
+        if not generation.accepts_handoffs():
+            # The generation ended (committed or abandoned) before the message
+            # finished assembling. It must never become a handoff message.
+            LOGGER.debug(
+                'Discarding assembled %s content for ended delivery '
+                'generation %s', kind, generation.seq)
+            return
+
+        if kind == _DELIVER_KIND:
+            consumer_tag = method_frame.method.consumer_tag
+            generation.stage_deliver(method_frame,
+                                     header_frame,
+                                     body,
+                                     consumer_tag=consumer_tag,
+                                     noack=consumer_tag
+                                     in self._consumers_with_noack)
+        elif kind == _GET_KIND:
+            if self._on_getok_callback is None:
+                LOGGER.error('Basic.GetOk received with no active callback')
+                return
+            self._stage_getok_handoff(generation, method_frame, header_frame,
+                                      body)
+        else:
+            generation.stage_return(method_frame, header_frame, body)
+
+    def _dispatch_assembled_now(self, kind: str, method_frame: frame.Method,
+                                header_frame: frame.Header,
+                                body: bytes) -> None:
+        """Take the immediate legacy exit for assembled content of kind."""
+        if kind == _DELIVER_KIND:
+            self._on_deliver(method_frame, header_frame, body)
+        elif kind == _GET_KIND:
+            self._on_getok(method_frame, header_frame, body)
+        else:
+            self._on_return(method_frame, header_frame, body)
+
+    def _commit_delivery_generation(self,
+                                    generation: DeliveryGeneration) -> None:
+        """Flush staged handoffs to user callbacks in arrival order, then send
+        the generation's pending confirmation intents, and pop the generation.
+        """
+        if not generation.accepts_handoffs():
+            raise exceptions.DeliveryGenerationClosed(
+                'Delivery generation %s is not open' % generation.seq)
+        if self.current_delivery_generation is not generation:
+            raise exceptions.DeliveryGenerationError(
+                'Delivery generation %s is not the current generation; '
+                'commit the inner generation first' % generation.seq)
+
+        generation.mark_committing()
+        try:
+            handoffs = generation.drain_handoffs()
+            for handoff in handoffs:
+                if handoff.kind == _DELIVER_KIND:
+                    self._execute_deliver_handoff(handoff.method_frame,
+                                                  handoff.header_frame,
+                                                  handoff.body)
+                elif handoff.kind == _GET_KIND:
+                    if handoff.callback is not None:
+                        handoff.callback(self, handoff.method_frame.method,
+                                         handoff.header_frame.properties,
+                                         handoff.body)
+                else:
+                    self._execute_return_handoff(handoff.method_frame,
+                                                 handoff.header_frame,
+                                                 handoff.body)
+
+            for intent in generation.drain_confirmation_intents():
+                self._send_confirmation_intent(generation, intent)
+        except BaseException:
+            # An inner failure must not leave the generation's remaining
+            # staged handoffs or confirmation intents observable.
+            self._abandon_delivery_generation(generation, requeue=True)
+            raise
+
+        generation.mark_committed()
+        self._delivery_generations.pop()
+
+    def _abandon_delivery_generation(self, generation: DeliveryGeneration,
+                                     requeue: bool) -> None:
+        """Invalidate a generation without delivering its staged handoffs.
+
+        Staged Deliver handoffs are rejected (ackable consumers) or dropped
+        (no-ack); staged GetOk handoffs are dropped with the one-shot slot
+        already released; staged Basic.Return handoffs are dropped. Pending
+        confirmation intents are discarded and can never reach any other
+        generation's delivery tags.
+        """
+        if not generation.accepts_handoffs() and not generation.is_committing:
+            raise exceptions.DeliveryGenerationClosed(
+                'Delivery generation %s is not open' % generation.seq)
+        if self.current_delivery_generation is not generation:
+            raise exceptions.DeliveryGenerationError(
+                'Delivery generation %s is not the current generation; '
+                'abandon the inner generation first' % generation.seq)
+
+        self._content_assembler.invalidate_partial_generation(generation)
+
+        for handoff in generation.drain_handoffs():
+            if handoff.kind == _DELIVER_KIND:
+                self._reject_staged_deliver(handoff, requeue)
+            # GetOk and Return handoffs are dropped with no wire action. The
+            # Get one-shot slot was released when the handoff was staged.
+
+        # Unsent confirmation intents die with the generation.
+        generation.drain_confirmation_intents()
+
+        generation.mark_abandoned()
+        self._delivery_generations.pop()
+        self._notify_generation_abandoned(generation.seq)
+
+    def _reject_staged_deliver(self, handoff: _StagedHandoff,
+                               requeue: bool) -> None:
+        """Settle a staged Deliver handoff that will never be committed: reject
+        it for ackable consumers while the channel is open, drop it otherwise.
+        """
+        if self.is_open and not handoff.noack:
+            self.basic_reject(handoff.method_frame.method.delivery_tag,
+                              requeue=requeue)
+
+    def _send_confirmation_intent(self, generation: DeliveryGeneration,
+                                  intent: _ConfirmationIntent) -> None:
+        """Send a staged ack/nack/reject intent. Multiple intents are expanded
+        per owned delivery tag so they can never settle tags owned by another
+        generation on the same channel.
+        """
+        if intent.kind == _REJECT_INTENT:
+            if intent.delivery_tag not in generation.owned_delivery_tags:
+                raise exceptions.DeliveryTagNotInGeneration(
+                    'delivery tag %s was not handed off within delivery '
+                    'generation %s' % (intent.delivery_tag, generation.seq))
+            self._send_method(
+                spec.Basic.Reject(intent.delivery_tag, intent.requeue))
+            return
+
+        owned = generation.owned_delivery_tags
+        if intent.multiple:
+            if intent.delivery_tag == 0:
+                targets = sorted(owned)
+            else:
+                if intent.delivery_tag not in owned:
+                    raise exceptions.DeliveryTagNotInGeneration(
+                        'delivery tag %s was not handed off within delivery '
+                        'generation %s' % (intent.delivery_tag, generation.seq))
+                targets = sorted(
+                    tag for tag in owned if tag <= intent.delivery_tag)
+        else:
+            if intent.delivery_tag not in owned:
+                raise exceptions.DeliveryTagNotInGeneration(
+                    'delivery tag %s was not handed off within delivery '
+                    'generation %s' % (intent.delivery_tag, generation.seq))
+            targets = [intent.delivery_tag]
+
+        for tag in targets:
+            if intent.kind == _ACK_INTENT:
+                self._send_method(spec.Basic.Ack(tag, False))
+            else:
+                self._send_method(spec.Basic.Nack(tag, False, intent.requeue))
+
+    def _settle_consumer_generation_ledgers(self, consumer_tag: str) -> None:
+        """Common invalidation of the staged-handoff and half-assembly ledgers
+        of one consumer: reject (ackable) or drop (no-ack) its uncommitted
+        staged Deliver handoffs in every still-open generation and kill any
+        half-assembled Deliver for it. GetOk and Return ledgers are not
+        touched.
+        """
+        self._content_assembler.invalidate_deliver_partial(consumer_tag)
+        for generation in self._delivery_generations:
+            if not generation.accepts_handoffs():
+                continue
+            for handoff in generation.remove_deliver_handoffs(consumer_tag):
+                self._reject_staged_deliver(handoff, requeue=True)
+
+    def _generation_on_user_nowait_cancel(self, consumer_tag: str) -> None:
+        """Invalidation rule for a user-initiated nowait Basic.Cancel.
+
+        Immediate on all three ledgers: staged Deliver handoffs are rejected
+        or dropped, the half assembly is killed, and pending confirmation
+        intents for the consumer's delivery tags are dropped.
+        """
+        self._settle_consumer_generation_ledgers(consumer_tag)
+        for generation in self._delivery_generations:
+            if generation.accepts_handoffs():
+                generation.remove_confirmation_intents_for_consumer(
+                    consumer_tag)
+
+    def _generation_on_broker_cancel(self, consumer_tag: str) -> None:
+        """Invalidation rule for a broker-initiated Basic.Cancel.
+
+        Staged Deliver handoffs and the half assembly are taken immediately,
+        but pending confirmation intents are preserved: messages already
+        handed off can still be settled after the consumer is gone.
+        """
+        self._settle_consumer_generation_ledgers(consumer_tag)
+
+    def _generation_on_waited_cancel_confirmed(self, consumer_tag: str) -> None:
+        """Invalidation rule at Basic.CancelOk for a waited Basic.Cancel.
+
+        Nothing was settled at cancel-request time; anything still staged or
+        half assembled is settled at the CancelOk boundary, while pending
+        confirmation intents are preserved.
+        """
+        self._settle_consumer_generation_ledgers(consumer_tag)
+
+    def _generation_tear_down_for_close(self) -> None:
+        """Whole-ledger invalidation used by Channel.close (and by final
+        cleanup on broker-initiated close): every open generation is abandoned
+        across all three handoff kinds, every pending confirmation intent is
+        discarded and every generation-bound partial assembly is killed.
+        """
+        generations = list(self._delivery_generations)
+        self._delivery_generations = []
+
+        abandoned_seqs = []
+        for generation in generations:
+            if not generation.accepts_handoffs() \
+                    and not generation.is_committing:
+                continue
+
+            self._content_assembler.invalidate_partial_generation(generation)
+
+            for handoff in generation.drain_handoffs():
+                if handoff.kind == _DELIVER_KIND:
+                    self._reject_staged_deliver(handoff, requeue=True)
+                # GetOk and Return handoffs are dropped with no wire action.
+
+            generation.drain_confirmation_intents()
+            generation.mark_abandoned()
+            abandoned_seqs.append(generation.seq)
+
+        for seq in abandoned_seqs:
+            self._notify_generation_abandoned(seq)
+
+    def _notify_generation_abandoned(self, seq: int) -> None:
+        """Tell the scheduling surface pinned to this channel (e.g. a
+        BlockingChannel) that a generation has been abandoned so that events
+        already queued for it can be voided before dispatch.
+        """
+        cookie = self._get_cookie()
+        observer = getattr(cookie, '_on_delivery_generation_abandoned', None)
+        if callable(observer):
+            observer(seq)
+
+    def _execute_deliver_handoff(self, method_frame: frame.Method,
+                                 header_frame: frame.Header,
+                                 body: bytes) -> None:
+        """Perform the consumer-callback dispatch for an assembled Basic.Deliver
+        handoff. Used both for the legacy immediate path and when replaying a
+        committed generation. Preserves tip closing-discard semantics (#1389).
+        """
+        consumer_tag = method_frame.method.consumer_tag
+
+        if not self.is_open:
+            self._discarded_while_closing += 1
+            LOGGER.debug('Delivery while %s: %r', self._state, method_frame)
+            return
+
+        if consumer_tag not in self._consumers:
+            LOGGER.error('Unexpected delivery: %r', method_frame)
+            return
+
+        self._consumers[consumer_tag](self, method_frame.method,
+                                      header_frame.properties, body)
+
+
+    def _stage_getok_handoff(self, generation: DeliveryGeneration,
+                             method_frame: frame.Method,
+                             header_frame: frame.Header, body: bytes) -> None:
+        """Capture the one-shot Basic.Get callback onto a generation and
+        release the Basic.Get callback slot immediately, so another
+        basic_get may be issued while the handoff awaits commit.
+
+        :param DeliveryGeneration generation: the generation to stage into
+        :param pika.frame.Method method_frame: The method frame received
+        :param pika.frame.Header header_frame: The header frame received
+        :param bytes body: The body received
+
+        """
+        callback = self._on_getok_callback
+        self._on_getok_callback = None
+        generation.stage_getok(method_frame, header_frame, body, callback)
+
+    def _execute_return_handoff(self, method_frame: frame.Method,
+                                header_frame: frame.Header,
+                                body: bytes) -> None:
+        """Dispatch a (possibly replayed) Basic.Return handoff through the
+        ``_on_return`` callback registry.
+
+        :param pika.frame.Method method_frame: The Basic.Return frame
+        :param pika.frame.Header header_frame: The content header frame
+        :param bytes body: The message body
+
+        """
+        if not self.callbacks.process(self.channel_number, '_on_return', self,
+                                      self, method_frame.method,
+                                      header_frame.properties, body):
+            LOGGER.debug('Basic.Return received from server (%r, %r)',
+                         method_frame.method, header_frame.properties)
+
     def close(self,
               reply_code: int = 0,
               reply_text: str = 'Normal shutdown') -> None:
@@ -690,9 +1096,18 @@ class Channel:
         self._closing_reason = exceptions.ChannelClosedByClient(
             reply_code, reply_text)
 
-        for consumer_tag in list(self._consumers.keys()):
-            if consumer_tag not in self._cancelled:
-                self.basic_cancel(consumer_tag=consumer_tag)
+        self._in_close_consumer_cancel = True
+        try:
+            for consumer_tag in list(self._consumers.keys()):
+                if consumer_tag not in self._cancelled:
+                    self.basic_cancel(consumer_tag=consumer_tag)
+        finally:
+            self._in_close_consumer_cancel = False
+
+        # Close tears down the entire inbound generation ledger while the
+        # channel is still OPEN so ackable staged Deliver handoffs can still
+        # be rejected. Distinct from per-consumer cancel rules.
+        self._generation_tear_down_for_close()
 
         # Change state after cancelling consumers to avoid
         # ChannelWrongStateError exception from basic_cancel
@@ -1164,6 +1579,11 @@ class Channel:
 
     def _cleanup(self) -> None:
         """Remove all consumers and any callbacks for the channel."""
+        # Generations still open when the channel dies are abandoned so
+        # staged handoffs / confirmation intents cannot leak.
+        if self._delivery_generations:
+            self._generation_tear_down_for_close()
+
         self.callbacks.process(self.channel_number,
                                self._ON_CHANNEL_CLEANUP_CB_KEY, self, self)
         self._consumers = {}
@@ -1178,6 +1598,7 @@ class Channel:
 
         :param consumer_tag: The consumer tag to cleanup
         """
+        self._consumers_with_noack.discard(consumer_tag)
         self._consumers.pop(consumer_tag, None)
         self._cancelled.discard(consumer_tag)
 
@@ -1270,21 +1691,33 @@ class Channel:
             self._send_method(spec.Basic.CancelOk(consumer_tag=consumer_tag))
 
         if consumer_tag in self._cancelled:
-            # User-initiated cancel is waiting for Cancel-ok
+            # User-initiated cancel is waiting for Cancel-ok; generation
+            # settlement is deferred to _on_cancelok.
             return
+
+        # Broker-initiated cancel settles staged handoffs / half-assembly
+        # for this consumer immediately; confirmation intents remain valid.
+        self._generation_on_broker_cancel(consumer_tag)
 
         self._cleanup_consumer_ref(consumer_tag)
 
     def _on_cancelok(self, method_frame: frame.Method,
-                     callback: _OnBasicCancelCallback) -> None:
+                     callback: _OnBasicCancelCallback | None = None) -> None:
         """
         Called in response to a frame from the Broker when the client sends Basic.Cancel.
 
         :param method_frame: The method frame received
-        :param callback: The caller's `basic_cancel` callback, run once the consumer is retired
+        :param callback: The caller's `basic_cancel` callback, run once the consumer is retired.
+            Optional so unit tests (and any direct settlement path) can drive CancelOk without a
+            bound partial.
         """
-        self._cleanup_consumer_ref(method_frame.method.consumer_tag)
-        callback(method_frame)
+        consumer_tag = method_frame.method.consumer_tag
+        # Waited-cancel boundary: settle staged / half-assembled for this
+        # consumer now; pending confirmation intents are preserved.
+        self._generation_on_waited_cancel_confirmed(consumer_tag)
+        self._cleanup_consumer_ref(consumer_tag)
+        if callback is not None:
+            callback(method_frame)
 
     def _transition_to_closed(self) -> None:
         """Common logic for transitioning the channel to the CLOSED state:
@@ -1384,35 +1817,26 @@ class Channel:
         If a particular consumer is still active when another delivery appears for it, queue the
         deliveries up until it finally exits.
 
+        When a delivery generation is active, the handoff is staged on that generation instead of
+        reaching the consumer callback; it is delivered only when the generation is committed.
+
         :param method_frame: The method frame received
         :param header_frame: The header frame received
         :param body: The body received
         """
-        consumer_tag = method_frame.method.consumer_tag
-
-        if not self.is_open:
-            # Closing or closed. A callback could not acknowledge this delivery
-            # even if it ran: the channel refuses the frame and that exception
-            # would escape into frame processing and abort the transport. The
-            # delivery is left unacknowledged, which the broker redelivers on a
-            # manual-ack consumer, and the RabbitMQ Java client discards the
-            # same way (ChannelN.processAsync while quiescing).  A caller that
-            # needs the backlog run first cancels its consumers and waits for
-            # Basic.CancelOk before closing, which pika.Connection and
-            # BlockingChannel both do (#1389).
-            self._discarded_while_closing += 1
-            LOGGER.debug('Delivery while %s: %r', self._state, method_frame)
+        generation = self.current_delivery_generation
+        if generation is not None and generation.accepts_handoffs():
+            consumer_tag = method_frame.method.consumer_tag
+            generation.stage_deliver(method_frame,
+                                     header_frame,
+                                     body,
+                                     consumer_tag=consumer_tag,
+                                     noack=consumer_tag
+                                     in self._consumers_with_noack)
             return
 
-        if consumer_tag not in self._consumers:
-            # Either never known, or retained past the cancelled-tag cap. The
-            # delivery is left unacknowledged for the broker to redeliver;
-            # rejecting it here is what #1389 removed.
-            LOGGER.error('Unexpected delivery: %r', method_frame)
-            return
+        self._execute_deliver_handoff(method_frame, header_frame, body)
 
-        self._consumers[consumer_tag](self, method_frame.method,
-                                      header_frame.properties, body)
 
     def _on_eventok(self, method_frame: frame.Method) -> None:
         """
@@ -1462,16 +1886,26 @@ class Channel:
         """
         Called in reply to a Basic.Get when there is a message.
 
+        When a delivery generation is active, the one-shot Get handoff is captured onto the
+        generation; the user callback runs only when the generation is committed.
+
         :param method_frame: The method frame received
         :param header_frame: The header frame received
         :param body: The body received
         """
+        generation = self.current_delivery_generation
+        if generation is not None and generation.accepts_handoffs()                 and self._on_getok_callback is not None:
+            self._stage_getok_handoff(generation, method_frame, header_frame,
+                                      body)
+            return
+
         if self._on_getok_callback is not None:
             callback = self._on_getok_callback
             self._on_getok_callback = None
             callback(self, method_frame.method, header_frame.properties, body)
         else:
             LOGGER.error('Basic.GetOk received with no active callback')
+
 
     def _on_openok(self, method_frame: frame.Method) -> None:
         """
@@ -1498,15 +1932,20 @@ class Channel:
         """
         Called if the server sends a Basic.Return frame.
 
+        When a delivery generation is active, the returned-message handoff is staged and only
+        reaches registered ``_on_return`` callbacks when the generation is committed.
+
         :param method_frame: The Basic.Return frame
         :param header_frame: The content header frame
         :param body: The message body
         """
-        if not self.callbacks.process(self.channel_number, '_on_return', self,
-                                      self, method_frame.method,
-                                      header_frame.properties, body):
-            LOGGER.debug('Basic.Return received from server (%r, %r)',
-                         method_frame.method, header_frame.properties)
+        generation = self.current_delivery_generation
+        if generation is not None and generation.accepts_handoffs():
+            generation.stage_return(method_frame, header_frame, body)
+            return
+
+        self._execute_return_handoff(method_frame, header_frame, body)
+
 
     def _on_selectok(self, method_frame: frame.Method) -> None:
         """
@@ -1706,77 +2145,502 @@ class Channel:
 
 
 class ContentFrameAssembler:
-    """Handle content related frames, building a message and return the message back in three parts
-    upon receipt.
+    """Handle content related frames, building a message and return the message
+    back in three parts upon receipt.
+
+    When constructed with a generation sink (the owning Channel), content is
+    never returned from :meth:`process`: a partial assembly is bound to the
+    delivery generation current at the method frame, and the completed
+    content is reported through the sink. Deliver, Get and Return partials
+    share the single in-flight assembly slot but are tracked by their own kind
+    so that invalidation rules can diverge.
+
     """
 
-    def __init__(self) -> None:
-        """Create a new instance of the content frame assembler."""
-        self._method_frame: frame.Method | None = None
-        self._header_frame: frame.Header | None = None
+    def __init__(self, generation_sink: Optional[Any] = None) -> None:
+        """Create a new instance of the conent frame assembler.
+
+        :param generation_sink: object implementing
+            ``_generation_bind_partial(kind, method_frame)`` and
+            ``_generation_accept_assembled(kind, generation, method_frame,
+            header_frame, body)``. When ``None``, :meth:`process` returns the
+            assembled content tuple directly (legacy behavior).
+
+        """
+        self._generation_sink = generation_sink
+        self._method_frame: Optional[frame.Method] = None
+        self._header_frame: Optional[frame.Header] = None
         self._seen_so_far = 0
-        self._body_fragments: list[bytes] = []
+        self._body_fragments: List[bytes] = list()
+        # Kind and generation token of the in-flight partial assembly.
+        self._partial_kind: Optional[str] = None
+        self._partial_generation: Optional[DeliveryGeneration] = None
+        # Once true, header and body frames belonging to this partial are
+        # swallowed until the next content method frame. Used when the partial
+        # is invalidated mid-assembly.
+        self._partial_dead: bool = False
 
     def process(
         self, frame_value: frame.Frame
-    ) -> tuple[frame.Method, frame.Header, bytes] | None:
-        """
-        Invoked by the Channel object when passed frames that are not setup in the rpc process and
-        that don't have explicit reply types defined. This includes Basic.Publish, Basic.GetOk and
-        Basic.Return.
+    ) -> Optional[Tuple[frame.Method, frame.Header, bytes]]:
+        """Invoked by the Channel object when passed frames that are not
+        setup in the rpc process and that don't have explicit reply types
+        defined. This includes Basic.Publish, Basic.GetOk and Basic.Return
 
-        :param frame_value: The frame to process
+        :param Method|Header|Body frame_value: The frame to process
+
         """
-        frame_type = frame_value.frame_type
-        if frame_type == spec.FRAME_METHOD:
-            assert isinstance(frame_value, frame.Method)
-            if spec.has_content(frame_value.method.INDEX):
-                self._method_frame = frame_value
-                return None
-        elif frame_type == spec.FRAME_HEADER:
-            assert isinstance(frame_value, frame.Header)
-            self._header_frame = frame_value
-            if frame_value.body_size == 0:
-                return self._finish()
-            return None
-        elif frame_type == spec.FRAME_BODY:
-            assert isinstance(frame_value, frame.Body)
+        if (isinstance(frame_value, frame.Method) and
+                spec.has_content(frame_value.method.INDEX)):
+            return self._handle_method_frame(frame_value)
+        elif isinstance(frame_value, frame.Header):
+            return self._handle_header_frame(frame_value)
+        elif isinstance(frame_value, frame.Body):
             return self._handle_body_frame(frame_value)
-        raise exceptions.UnexpectedFrameError(frame_value)
+        else:
+            raise exceptions.UnexpectedFrameError(frame_value)
 
-    def _finish(self) -> tuple[frame.Method, frame.Header, bytes]:
-        """Invoked when all of the message has been received."""
-        assert self._method_frame is not None
-        assert self._header_frame is not None
-        content = (self._method_frame, self._header_frame,
-                   b''.join(self._body_fragments))
+    def invalidate_partial_generation(self,
+                                      generation: DeliveryGeneration) -> None:
+        """Kill the in-flight partial assembly if it is bound to the given
+        (abandoned or closing) generation. Its straggler header/body frames are
+        swallowed until the next content method frame.
+        """
+        if self._partial_generation is generation:
+            self._partial_dead = True
+
+    def invalidate_deliver_partial(self, consumer_tag: str) -> None:
+        """Kill the in-flight partial assembly only if it is a Basic.Deliver
+        for the given consumer tag. GetOk and Return partials are left alone:
+        the three kinds have distinct invalidation rules.
+        """
+        if (not self._partial_dead and self._partial_kind == _DELIVER_KIND and
+                self._method_frame is not None and
+                self._method_frame.method.consumer_tag == consumer_tag):
+            self._partial_dead = True
+
+    def _handle_method_frame(
+        self, method_frame: frame.Method
+    ) -> Optional[Tuple[frame.Method, frame.Header, bytes]]:
+        kind = self._content_kind(method_frame)
+        if self._generation_sink is None:
+            # Legacy behavior: a content method frame only records itself;
+            # out-of-order frames must not reset previously recorded state.
+            self._method_frame = method_frame
+            self._partial_kind = kind
+            return None
+        # Bound mode: a content method frame is the start of a fresh message.
         self._reset()
-        return content
+        self._method_frame = method_frame
+        self._partial_kind = kind
+        self._partial_dead = False
+        self._partial_generation = self._generation_sink \
+            ._generation_bind_partial(kind, method_frame)
+        return None
+
+    def _handle_header_frame(
+        self, header_frame: frame.Header
+    ) -> Optional[Tuple[frame.Method, frame.Header, bytes]]:
+        if self._partial_dead:
+            LOGGER.debug('Discarding content header for invalidated delivery '
+                         'generation assembly')
+            return None
+        self._header_frame = header_frame
+        if header_frame.body_size == 0:
+            return self._finish()
+        return None
+
+    def _finish(self) -> Optional[Tuple[frame.Method, frame.Header, bytes]]:
+        """Invoked when all of the message has been received
+
+        :rtype: tuple(pika.frame.Method, pika.frame.Header, str)|None
+
+        """
+        if self._generation_sink is None:
+            assert self._method_frame is not None
+            assert self._header_frame is not None
+            content = (self._method_frame, self._header_frame,
+                       b''.join(self._body_fragments))
+            self._reset()
+            return content
+
+        kind = self._partial_kind
+        generation = self._partial_generation
+        method_frame = self._method_frame
+        header_frame = self._header_frame
+        body = b''.join(self._body_fragments)
+        self._reset()
+        self._generation_sink._generation_accept_assembled(
+            kind, generation, method_frame, header_frame, body)
+        return None
 
     def _handle_body_frame(
         self, body_frame: frame.Body
-    ) -> tuple[frame.Method, frame.Header, bytes] | None:
-        """
-        Receive body frames and append them to the stack.
+    ) -> Optional[Tuple[frame.Method, frame.Header, bytes]]:
+        """Receive body frames and append them to the stack. When the body size
+        matches, call the finish method.
 
-        When the body size matches, call the finish method.
-
-        :param body_frame: The body frame
+        :param Body body_frame: The body frame
         :raises: pika.exceptions.BodyTooLongError
+        :rtype: tuple(pika.frame.Method, pika.frame.Header, str)|None
+
         """
+        if self._partial_dead:
+            LOGGER.debug(
+                'Discarding content body fragment for invalidated delivery '
+                'generation assembly')
+            return None
         self._seen_so_far += len(body_frame.fragment)
         self._body_fragments.append(body_frame.fragment)
-        assert self._header_frame is not None
-        if self._seen_so_far == self._header_frame.body_size:
+        if self._seen_so_far == self._header_frame.body_size:  # type: ignore
             return self._finish()
-        if self._seen_so_far > self._header_frame.body_size:
-            raise exceptions.BodyTooLongError(self._seen_so_far,
-                                              self._header_frame.body_size)
+        elif self._seen_so_far > self._header_frame.body_size:  # type: ignore
+            raise exceptions.BodyTooLongError(
+                self._seen_so_far, self._header_frame.body_size)  # type: ignore
+        return None
+
+    @staticmethod
+    def _content_kind(method_frame: frame.Method) -> Optional[str]:
+        """Map an inbound content method frame to its handoff kind.
+
+        Content methods that are never inbound (e.g. Basic.Publish) map to
+        ``None``; their assembled content is ignored by the Channel, matching
+        legacy behavior.
+        """
+        method = method_frame.method
+        if isinstance(method, spec.Basic.Deliver):
+            return _DELIVER_KIND
+        if isinstance(method, spec.Basic.GetOk):
+            return _GET_KIND
+        if isinstance(method, spec.Basic.Return):
+            return _RETURN_KIND
         return None
 
     def _reset(self) -> None:
-        """Reset the values for processing frames."""
+        """Reset the values for processing frames"""
         self._method_frame = None
         self._header_frame = None
         self._seen_so_far = 0
-        self._body_fragments = []
+        self._body_fragments = list()
+        self._partial_kind = None
+        self._partial_generation = None
+        self._partial_dead = False
+
+
+class _StagedHandoff:
+    """An inbound handoff intent staged within a delivery generation.
+
+    ``callback`` is only used by the one-shot Basic.GetOk kind. ``noack`` is
+    only used by the Deliver kind.
+    """
+
+    __slots__ = ('kind', 'method_frame', 'header_frame', 'body', 'consumer_tag',
+                 'noack', 'callback')
+
+    def __init__(self,
+                 kind: str,
+                 method_frame: frame.Method,
+                 header_frame: frame.Header,
+                 body: bytes,
+                 consumer_tag: Optional[str] = None,
+                 noack: bool = False,
+                 callback: Optional[Callable[..., Any]] = None) -> None:
+        self.kind = kind
+        self.method_frame = method_frame
+        self.header_frame = header_frame
+        self.body = body
+        self.consumer_tag = consumer_tag
+        self.noack = noack
+        self.callback = callback
+
+
+_ACK_INTENT = 'ack'
+_NACK_INTENT = 'nack'
+_REJECT_INTENT = 'reject'
+
+
+class _ConfirmationIntent:
+    """A pending ack/nack/reject intent staged within a delivery generation.
+
+    The intent is only sent to the broker when the generation commits, so it
+    can never settle delivery tags of another generation.
+    """
+
+    __slots__ = ('kind', 'delivery_tag', 'multiple', 'requeue', 'consumer_tag')
+
+    def __init__(self,
+                 kind: str,
+                 delivery_tag: int,
+                 multiple: bool = False,
+                 requeue: bool = True,
+                 consumer_tag: Optional[str] = None) -> None:
+        self.kind = kind
+        self.delivery_tag = delivery_tag
+        self.multiple = multiple
+        self.requeue = requeue
+        self.consumer_tag = consumer_tag
+
+
+class DeliveryGeneration:
+    """A nested epoch of inbound content handoffs bound to one Channel.
+
+    Content that fully assembles while the generation is current is staged as
+    a handoff intent and only reaches user callbacks after :meth:`commit`.
+    Abandoning the generation (explicitly, via :meth:`Channel
+    .advance_delivery_generation`, by leaving its context uncommitted, or as
+    part of :meth:`Channel.close`) settles the staged handoffs with rules
+    specific to each kind:
+
+    * Deliver: ackable staged deliveries are rejected back to the broker and
+      no-ack deliveries are dropped; a half assembly invalidated before it
+      completes is discarded without becoming a message.
+    * GetOk: the one-shot callback slot is released at staging time and the
+      handoff is dropped with no wire action on abandon.
+    * Return: handoffs are simply dropped; there is nothing to confirm.
+
+    Confirmation intents (:meth:`ack`, :meth:`nack`, :meth:`reject`) are sent
+    on commit and discarded on abandon; non-multiple intents must name a
+    delivery tag handed off within this same generation, and multiple intents
+    are expanded so they cannot settle tags owned by another generation.
+
+    Instances are context managers: leaving the ``with`` block uncommitted
+    abandons the generation, which lets an inner, short-lived generation clean
+    up its own side effects on exception.
+
+    """
+
+    OPEN = 1
+    COMMITTING = 2
+    COMMITTED = 3
+    ABANDONED = 4
+
+    def __init__(self, channel: Channel, seq: int) -> None:
+        self._channel = channel
+        self.seq = seq
+        self._state = self.OPEN
+        self._handoffs: List[_StagedHandoff] = list()
+        self._confirmation_intents: List[_ConfirmationIntent] = list()
+        # Delivery tags (Deliver and GetOk) that entered this generation and
+        # the consumer tag each Deliver tag belongs to.
+        self._owned_delivery_tags: Set[int] = set()
+        self._delivery_tag_consumer: Dict[int, Optional[str]] = dict()
+
+    def __repr__(self) -> str:
+        return '<DeliveryGeneration seq=%s state=%s staged_handoffs=%i>' % (
+            self.seq, self._state, len(self._handoffs))
+
+    def __enter__(self) -> DeliveryGeneration:
+        return self
+
+    def __exit__(self, exc_type: Optional[Type[BaseException]],
+                 exc_val: Optional[BaseException], exc_tb: Any) -> None:
+        if self._state in (self.OPEN, self.COMMITTING):
+            self.abandon()
+
+    @property
+    def is_open(self) -> bool:
+        """True while the generation may still accept staged handoffs."""
+        return self._state == self.OPEN
+
+    @property
+    def is_committing(self) -> bool:
+        """True while the commit flush is dispatching handoffs."""
+        return self._state == self.COMMITTING
+
+    @property
+    def is_committed(self) -> bool:
+        """True once the generation has been committed and popped."""
+        return self._state == self.COMMITTED
+
+    @property
+    def is_abandoned(self) -> bool:
+        """True once the generation has been abandoned and popped."""
+        return self._state == self.ABANDONED
+
+    @property
+    def staged_handoff_count(self) -> int:
+        """Number of handoffs currently staged (test/introspection aid)."""
+        return len(self._handoffs)
+
+    @property
+    def owned_delivery_tags(self) -> Set[int]:
+        """The set of delivery tags handed off within this generation."""
+        return self._owned_delivery_tags
+
+    def accepts_handoffs(self) -> bool:
+        return self._state in (self.OPEN, self.COMMITTING)
+
+    def stage_deliver(self, method_frame: frame.Method,
+                      header_frame: frame.Header, body: bytes,
+                      consumer_tag: str, noack: bool) -> None:
+        """Stage a Basic.Deliver handoff intent."""
+        self._require_open()
+        tag = method_frame.method.delivery_tag
+        self._owned_delivery_tags.add(tag)
+        self._delivery_tag_consumer[tag] = consumer_tag
+        self._handoffs.append(
+            _StagedHandoff(_DELIVER_KIND,
+                           method_frame,
+                           header_frame,
+                           body,
+                           consumer_tag=consumer_tag,
+                           noack=noack))
+
+    def stage_getok(self, method_frame: frame.Method,
+                    header_frame: frame.Header, body: bytes,
+                    callback: Optional[Callable[..., Any]]) -> None:
+        """Stage a Basic.GetOk handoff intent carrying its one-shot callback.
+        """
+        self._require_open()
+        tag = method_frame.method.delivery_tag
+        self._owned_delivery_tags.add(tag)
+        self._delivery_tag_consumer[tag] = None
+        self._handoffs.append(
+            _StagedHandoff(_GET_KIND,
+                           method_frame,
+                           header_frame,
+                           body,
+                           callback=callback))
+
+    def stage_return(self, method_frame: frame.Method,
+                     header_frame: frame.Header, body: bytes) -> None:
+        """Stage a Basic.Return handoff intent."""
+        self._require_open()
+        self._handoffs.append(
+            _StagedHandoff(_RETURN_KIND, method_frame, header_frame, body))
+
+    def commit(self) -> None:
+        """Flush staged handoffs to user callbacks in arrival order, send the
+        pending confirmation intents and pop the generation.
+
+        :raises exceptions.DeliveryGenerationClosed: if the generation has
+            already ended
+
+        """
+        self._channel._commit_delivery_generation(self)  # pylint: disable=W0212
+
+    def abandon(self, requeue: bool = True) -> None:
+        """Settle and discard everything staged in the generation without
+        invoking user callbacks, discard pending confirmation intents and pop
+        the generation.
+
+        :param bool requeue: requeue ackable staged Deliver handoffs
+
+        """
+        self._channel._abandon_delivery_generation(  # pylint: disable=W0212
+            self, requeue)
+
+    def ack(self, delivery_tag: int = 0, multiple: bool = False) -> None:
+        """Stage a Basic.Ack confirmation intent for delivery tags handed off
+        within this generation. Sent on :meth:`commit`, discarded on abandon.
+
+        :param integer delivery_tag: server-assigned delivery tag; 0 with
+            ``multiple`` covers all tags owned by this generation
+        :param bool multiple: acknowledge every owned tag up to
+            ``delivery_tag`` (expanded per-tag so no other generation's tags
+            are ever touched)
+
+        """
+        self._stage_confirmation(_ACK_INTENT,
+                                 delivery_tag,
+                                 multiple,
+                                 True,
+                                 require_owned=not multiple and
+                                 delivery_tag != 0)
+
+    def nack(self,
+             delivery_tag: int = 0,
+             multiple: bool = False,
+             requeue: bool = True) -> None:
+        """Stage a Basic.Nack confirmation intent. See :meth:`ack` for the
+        generation-scoping rules.
+
+        :param integer delivery_tag: server-assigned delivery tag
+        :param bool multiple: nack every owned tag up to ``delivery_tag``
+        :param bool requeue: ask the broker to requeue the messages
+
+        """
+        self._stage_confirmation(_NACK_INTENT,
+                                 delivery_tag,
+                                 multiple,
+                                 requeue,
+                                 require_owned=not multiple and
+                                 delivery_tag != 0)
+
+    def reject(self, delivery_tag: int, requeue: bool = True) -> None:
+        """Stage a Basic.Reject confirmation intent for a single delivery tag
+        handed off within this generation.
+
+        :param integer delivery_tag: server-assigned delivery tag
+        :param bool requeue: ask the broker to requeue the message
+
+        """
+        self._stage_confirmation(_REJECT_INTENT,
+                                 delivery_tag,
+                                 False,
+                                 requeue,
+                                 require_owned=True)
+
+    def _stage_confirmation(self, kind: str, delivery_tag: int, multiple: bool,
+                            requeue: bool, require_owned: bool) -> None:
+        if not self.accepts_handoffs():
+            raise exceptions.DeliveryGenerationClosed(
+                'Delivery generation %s is not open' % self.seq)
+        if not isinstance(delivery_tag, int):
+            raise TypeError('delivery_tag must be an integer')
+        if require_owned and delivery_tag not in self._owned_delivery_tags:
+            raise exceptions.DeliveryTagNotInGeneration(
+                'delivery tag %s was not handed off within delivery '
+                'generation %s' % (delivery_tag, self.seq))
+        consumer_tag = self._delivery_tag_consumer.get(delivery_tag)
+        self._confirmation_intents.append(
+            _ConfirmationIntent(kind, delivery_tag, multiple, requeue,
+                                consumer_tag))
+
+    def remove_deliver_handoffs(self,
+                                consumer_tag: str) -> List[_StagedHandoff]:
+        """Remove and return staged Deliver handoffs for one consumer tag.
+        GetOk and Return handoffs remain in place.
+        """
+        remaining: List[_StagedHandoff] = list()
+        removed: List[_StagedHandoff] = list()
+        for handoff in self._handoffs:
+            if handoff.kind == _DELIVER_KIND and \
+                    handoff.consumer_tag == consumer_tag:
+                removed.append(handoff)
+            else:
+                remaining.append(handoff)
+        self._handoffs = remaining
+        return removed
+
+    def remove_confirmation_intents_for_consumer(self,
+                                                 consumer_tag: str) -> None:
+        """Drop pending confirmation intents referring to one consumer tag."""
+        self._confirmation_intents = [
+            intent for intent in self._confirmation_intents
+            if intent.consumer_tag != consumer_tag
+        ]
+
+    def drain_handoffs(self) -> List[_StagedHandoff]:
+        handoffs = self._handoffs
+        self._handoffs = list()
+        return handoffs
+
+    def drain_confirmation_intents(self) -> List[_ConfirmationIntent]:
+        intents = self._confirmation_intents
+        self._confirmation_intents = list()
+        return intents
+
+    def mark_committing(self) -> None:
+        self._state = self.COMMITTING
+
+    def mark_committed(self) -> None:
+        self._state = self.COMMITTED
+
+    def mark_abandoned(self) -> None:
+        self._state = self.ABANDONED
+
+    def _require_open(self) -> None:
+        if not self.accepts_handoffs():
+            raise exceptions.DeliveryGenerationClosed(
+                'Delivery generation %s is not open' % self.seq)

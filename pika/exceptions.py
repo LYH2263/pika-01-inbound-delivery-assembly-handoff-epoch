@@ -477,3 +477,17 @@ class DuplicateGetOkCallback(ChannelError):
         return (
             f'{self.__class__.__name__}: basic_get can only be called again after the callback for '
             'the previous basic_get is executed')
+
+
+class DeliveryGenerationError(AMQPChannelError):
+    """Base class for errors related to inbound delivery generation ledgers."""
+
+
+class DeliveryGenerationClosed(DeliveryGenerationError):
+    """The delivery generation has already been committed or abandoned; it may
+    no longer be committed, abandoned, or receive confirmation intents."""
+
+
+class DeliveryTagNotInGeneration(DeliveryGenerationError):
+    """A confirmation intent (ack/nack/reject) staged on a delivery generation
+    names a delivery tag that was never handed off within that generation."""
